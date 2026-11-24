@@ -56,7 +56,18 @@ static constexpr double kRatioPhi = 1.6180339887;  // goldener Schnitt (Default)
 static constexpr float kGMin = 0.25f;        // Decay-Floor (nie ganz aus)
 static constexpr float kGMax = 0.686f;       // g*sqrt(2) ~ 0.97, stabil
 
-static constexpr float kBbdStages = 2048.f;  // BBD-Stufen -> f_clk = Stages/Delayzeit
+// BBD-Stufen (f_clk = Stages / Delayzeit). Gerastert auf echte Chip-Werte;
+// weniger Stufen = niedrigere Clock bei gleicher Delayzeit = dunkler/koerniger,
+// unabhaengig von der Raumgroesse (wie ein kleinerer BBD-Chip).
+static const float kStagesTable[4] = {512.f, 1024.f, 2048.f, 4096.f};
+static constexpr int kStagesCount = 4;
+static constexpr int kStagesDefaultIdx = 2;  // 2048 (Chip des Kits)
+static inline float stagesValue(double idx) {
+  int i = (int)std::lround(idx);
+  if (i < 0) i = 0;
+  if (i >= kStagesCount) i = kStagesCount - 1;
+  return kStagesTable[i];
+}
 
 // Rekonstruktions-/Anti-Alias-Tiefpass: Eckfrequenz = Bruchteil der Clock,
 // hart gedeckelt -> auch kleine Raeume bleiben dunkel (BBD-typisch).
@@ -94,14 +105,15 @@ enum {
   kParamDecay = 2,  // percent (0..100)
   kParamTone = 3,   // percent (0..100), 50 = neutral
   kParamMix = 4,    // percent (0..100)
-  kParamRatio = 5,  // 1.20..2.00
-  kParamMode = 6,   // stepped: 0 = Stereo, 1 = Mono
-  kParamCount = 7,
+  kParamRatio = 5,   // 1.20..2.00
+  kParamMode = 6,    // stepped: 0 = Stereo, 1 = Mono
+  kParamStages = 7,  // stepped: index 0..3 -> 512/1024/2048/4096
+  kParamCount = 8,
 };
 
 static const clap_id kParamOrder[kParamCount] = {
     kParamInput, kParamSize, kParamDecay, kParamTone,
-    kParamMix,   kParamRatio, kParamMode};
+    kParamMix,   kParamRatio, kParamStages, kParamMode};
 
 // ---------------------------------------------------------------------------
 // Plugin-Instanz
@@ -118,6 +130,7 @@ struct BbdReverb {
   std::atomic<double> p_mix{50.0};
   std::atomic<double> p_ratio{kRatioPhi};
   std::atomic<double> p_mode{0.0};  // 0 = Stereo, 1 = Mono
+  std::atomic<double> p_stages{(double)kStagesDefaultIdx};  // index 0..3
 
   double sample_rate = 48000.0;
   std::vector<float> buf_a;
@@ -132,6 +145,7 @@ struct BbdReverb {
   float s_tone = 0.5f;
   float s_gain = 1.f;
   float s_ratio = (float)kRatioPhi;
+  float s_stages = 2048.f;  // geglaettete Stufenzahl (-> f_clk, Bandbreite)
 
   // BBD-Clock-Sample&Hold pro Line
   float phase_a = 0.f, phase_b = 0.f;
@@ -188,6 +202,7 @@ struct BbdReverb {
     s_tone = (float)(p_tone.load() * 0.01);
     s_gain = (float)(p_input.load() * 0.01);
     s_ratio = (float)p_ratio.load();
+    s_stages = stagesValue(p_stages.load());
   }
 
   inline float readInterp(const std::vector<float> &buf, float d) const {
@@ -209,14 +224,15 @@ struct BbdReverb {
     const float tone_t = (float)(p_tone.load(std::memory_order_relaxed) * 0.01);
     const float gain_t = (float)(p_input.load(std::memory_order_relaxed) * 0.01);
     const float ratio_t = (float)p_ratio.load(std::memory_order_relaxed);
+    const float stages_t = stagesValue(p_stages.load(std::memory_order_relaxed));
     const bool mono = p_mode.load(std::memory_order_relaxed) >= 0.5;
 
     // Filter-Eckfrequenzen einmal pro Block aus den aktuellen Clocks.
-    // f_clk[Hz] = 2048 * fs / len ; corner = clamp(f_clk * frac).
+    // f_clk[Hz] = Stages * fs / len ; corner = clamp(f_clk * frac).
     const float fs = (float)sample_rate;
     const float len_b0 = s_len_a / s_ratio;
-    const float lp_ka = lpCoeff((kBbdStages * fs / s_len_a) * kLpClockFrac);
-    const float lp_kb = lpCoeff((kBbdStages * fs / len_b0) * kLpClockFrac);
+    const float lp_ka = lpCoeff((s_stages * fs / s_len_a) * kLpClockFrac);
+    const float lp_kb = lpCoeff((s_stages * fs / len_b0) * kLpClockFrac);
     const uint32_t maxd = max_len;
     const float sk = smooth_k;
 
@@ -227,6 +243,7 @@ struct BbdReverb {
       s_tone  += sk * (tone_t  - s_tone);
       s_gain  += sk * (gain_t  - s_gain);
       s_ratio += sk * (ratio_t - s_ratio);
+      s_stages += sk * (stages_t - s_stages);
 
       const float len_b = s_len_a / s_ratio;
 
@@ -249,8 +266,8 @@ struct BbdReverb {
       // BBD-Clock-Sample&Hold der Delay-Ausgaenge (Aliasing + Bandbegrenzung).
       // Phaseninkrement = f_clk/fs = 2048/len. Bei len > 2048 (grosse Raeume)
       // < 1 Tick/Sample -> ZOH-Stufen; bei kleinen Raeumen jede Probe neu.
-      const float inc_a = kBbdStages / s_len_a;
-      const float inc_b = kBbdStages / len_b;
+      const float inc_a = s_stages / s_len_a;
+      const float inc_b = s_stages / len_b;
       phase_a += inc_a;
       if (phase_a >= 1.f) { phase_a -= std::floor(phase_a); held_a = readInterp(buf_a, s_len_a); }
       phase_b += inc_b;
@@ -305,7 +322,7 @@ static const clap_plugin_descriptor_t s_descriptor = {
     "https://github.com/danielhuebert",
     "",
     "",
-    "1.1.0",
+    "1.2.0",
     "Analoger-BBD-Hall: zwei Delays im goldenen Schnitt + Hadamard-Feedback mit "
     "einem Minuszeichen, mit BBD-Lo-Fi (mki x es.edu / Moritz Klein).",
     s_features,
@@ -382,6 +399,13 @@ static bool pr_get_info(const clap_plugin_t *, uint32_t index,
       std::snprintf(info->name, sizeof(info->name), "Mode");
       info->min_value = 0.0; info->max_value = 1.0; info->default_value = 0.0;
       return true;
+    case kParamStages:
+      info->id = kParamStages;
+      info->flags = CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_AUTOMATABLE;
+      std::snprintf(info->name, sizeof(info->name), "Stages");
+      info->min_value = 0.0; info->max_value = (double)(kStagesCount - 1);
+      info->default_value = (double)kStagesDefaultIdx;
+      return true;
     default:
       return false;
   }
@@ -397,6 +421,7 @@ static bool pr_get_value(const clap_plugin_t *plugin, clap_id id, double *out) {
     case kParamMix:   *out = self->p_mix.load();   return true;
     case kParamRatio: *out = self->p_ratio.load(); return true;
     case kParamMode:  *out = self->p_mode.load();  return true;
+    case kParamStages:*out = self->p_stages.load();return true;
   }
   return false;
 }
@@ -418,6 +443,9 @@ static bool pr_value_to_text(const clap_plugin_t *, clap_id id, double value,
     case kParamMode:
       std::snprintf(out, cap, "%s", value >= 0.5 ? "Mono" : "Stereo");
       return true;
+    case kParamStages:
+      std::snprintf(out, cap, "%.0f", stagesValue(value));
+      return true;
   }
   return false;
 }
@@ -427,6 +455,22 @@ static bool pr_text_to_value(const clap_plugin_t *, clap_id id, const char *text
   if (!text) return false;
   if (id == kParamMode) {
     *out = (text[0] == 'M' || text[0] == 'm' || std::atof(text) >= 0.5) ? 1.0 : 0.0;
+    return true;
+  }
+  if (id == kParamStages) {
+    // accept a stage count (e.g. "1024") or an index; snap to nearest chip.
+    const double v = std::atof(text);
+    int best = kStagesDefaultIdx;
+    if (v >= 0.0 && v <= (double)(kStagesCount - 1) && v == std::floor(v)) {
+      best = (int)v;  // already an index
+    } else {
+      double bd = 1e18;
+      for (int i = 0; i < kStagesCount; ++i) {
+        const double d = std::fabs(v - kStagesTable[i]);
+        if (d < bd) { bd = d; best = i; }
+      }
+    }
+    *out = (double)best;
     return true;
   }
   *out = std::atof(text);
@@ -442,6 +486,10 @@ static void applyParamEvent(BbdReverb *self, const clap_event_param_value_t *ev)
     case kParamMix:   self->p_mix.store(std::clamp(ev->value, 0.0, 100.0)); break;
     case kParamRatio: self->p_ratio.store(std::clamp(ev->value, kRatioMin, kRatioMax)); break;
     case kParamMode:  self->p_mode.store(ev->value >= 0.5 ? 1.0 : 0.0); break;
+    case kParamStages:
+      self->p_stages.store(std::clamp((double)std::lround(ev->value), 0.0,
+                                      (double)(kStagesCount - 1)));
+      break;
     default: break;
   }
 }
@@ -466,7 +514,7 @@ static const clap_plugin_params_t s_params = {
 // state — alle 7 Parameterwerte serialisieren
 // ---------------------------------------------------------------------------
 
-static const uint32_t kStateMagic = 0x42425232;  // 'BBR2'
+static const uint32_t kStateMagic = 0x42425233;  // 'BBR3'
 
 static bool writeAll(const clap_ostream_t *os, const void *p, uint64_t n) {
   const uint8_t *b = (const uint8_t *)p;
@@ -489,11 +537,11 @@ static bool readAll(const clap_istream_t *is, void *p, uint64_t n) {
   return true;
 }
 
-// Layout: magic, dann 7 doubles: input, size, decay, tone, mix, ratio, mode.
+// Layout: magic, dann 8 doubles: input, size, decay, tone, mix, ratio, mode, stages.
 static bool st_save(const clap_plugin_t *plugin, const clap_ostream_t *os) {
   auto *self = (BbdReverb *)plugin->plugin_data;
   uint32_t magic = kStateMagic;
-  double vals[7];
+  double vals[8];
   vals[0] = self->p_input.load();
   vals[1] = self->p_size.load();
   vals[2] = self->p_decay.load();
@@ -501,13 +549,14 @@ static bool st_save(const clap_plugin_t *plugin, const clap_ostream_t *os) {
   vals[4] = self->p_mix.load();
   vals[5] = self->p_ratio.load();
   vals[6] = self->p_mode.load();
+  vals[7] = self->p_stages.load();
   return writeAll(os, &magic, sizeof(magic)) && writeAll(os, vals, sizeof(vals));
 }
 
 static bool st_load(const clap_plugin_t *plugin, const clap_istream_t *is) {
   auto *self = (BbdReverb *)plugin->plugin_data;
   uint32_t magic = 0;
-  double vals[7] = {0};
+  double vals[8] = {0};
   if (!readAll(is, &magic, sizeof(magic)) || magic != kStateMagic) return false;
   if (!readAll(is, vals, sizeof(vals))) return false;
   self->p_input.store(std::clamp(vals[0], 0.0, 200.0));
@@ -517,6 +566,8 @@ static bool st_load(const clap_plugin_t *plugin, const clap_istream_t *is) {
   self->p_mix.store(std::clamp(vals[4], 0.0, 100.0));
   self->p_ratio.store(std::clamp(vals[5], kRatioMin, kRatioMax));
   self->p_mode.store(vals[6] >= 0.5 ? 1.0 : 0.0);
+  self->p_stages.store(std::clamp((double)std::lround(vals[7]), 0.0,
+                                  (double)(kStagesCount - 1)));
   return true;
 }
 

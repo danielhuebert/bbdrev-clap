@@ -58,8 +58,8 @@ static int64_t mem_read(const clap_istream_t *s, void *buf, uint64_t n) {
 
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL: %s\n", #c); return 1; } } while (0)
 
-// Param ids: Input=0 Size=1 Decay=2 Tone=3 Mix=4 Ratio=5 Mode=6
-enum { P_INPUT=0, P_SIZE=1, P_DECAY=2, P_TONE=3, P_MIX=4, P_RATIO=5, P_MODE=6 };
+// Param ids: Input=0 Size=1 Decay=2 Tone=3 Mix=4 Ratio=5 Mode=6 Stages=7
+enum { P_INPUT=0, P_SIZE=1, P_DECAY=2, P_TONE=3, P_MIX=4, P_RATIO=5, P_MODE=6, P_STAGES=7 };
 
 int main(int argc, char **argv) {
   if (argc < 2) { std::printf("usage: %s <binary-in-bundle>\n", argv[0]); return 2; }
@@ -84,7 +84,17 @@ int main(int argc, char **argv) {
   auto *ports = (const clap_plugin_audio_ports_t *)plug->get_extension(plug, CLAP_EXT_AUDIO_PORTS);
   auto *state = (const clap_plugin_state_t *)plug->get_extension(plug, CLAP_EXT_STATE);
   CHECK(params && ports && state);
-  CHECK(params->count(plug) == 7);
+  CHECK(params->count(plug) == 8);
+
+  // Stages: stepped index -> chip value text; default index 2 = 2048.
+  double stDef = 0; params->get_value(plug, P_STAGES, &stDef);
+  CHECK((int)stDef == 2);
+  char st0[16] = {0}, st3[16] = {0};
+  params->value_to_text(plug, P_STAGES, 0.0, st0, sizeof(st0));
+  params->value_to_text(plug, P_STAGES, 3.0, st3, sizeof(st3));
+  std::printf("stages text: idx0=\"%s\" idx3=\"%s\" (default idx=%d)\n",
+              st0, st3, (int)stDef);
+  CHECK(std::strcmp(st0, "512") == 0 && std::strcmp(st3, "4096") == 0);
   CHECK(ports->count(plug, true) == 1 && ports->count(plug, false) == 1);
 
   clap_audio_port_info_t pi;
@@ -187,25 +197,30 @@ int main(int argc, char **argv) {
     EvList set; set.in.ctx = &set; set.in.size = ev_size; set.in.get = ev_get;
     set.evs.push_back(mkparam(P_SIZE, 73.0, 0));
     set.evs.push_back(mkparam(P_RATIO, 1.50, 0));
+    set.evs.push_back(mkparam(P_STAGES, 1.0, 0));  // 1024
     params->flush(plug, &set.in, &oe);
-    double sBefore=0, rBefore=0;
+    double sBefore=0, rBefore=0, stBefore=0;
     params->get_value(plug, P_SIZE, &sBefore);
     params->get_value(plug, P_RATIO, &rBefore);
+    params->get_value(plug, P_STAGES, &stBefore);
 
     MemBuf mb; clap_ostream_t os = {&mb, mem_write};
     CHECK(state->save(plug, &os));
     EvList clob; clob.in.ctx = &clob; clob.in.size = ev_size; clob.in.get = ev_get;
     clob.evs.push_back(mkparam(P_SIZE, 10.0, 0));
     clob.evs.push_back(mkparam(P_RATIO, 2.0, 0));
+    clob.evs.push_back(mkparam(P_STAGES, 3.0, 0));
     params->flush(plug, &clob.in, &oe);
     clap_istream_t is = {&mb, mem_read};
     CHECK(state->load(plug, &is));
-    double sAfter=0, rAfter=0;
+    double sAfter=0, rAfter=0, stAfter=0;
     params->get_value(plug, P_SIZE, &sAfter);
     params->get_value(plug, P_RATIO, &rAfter);
-    std::printf("state roundtrip: size %.0f->%.0f  ratio %.3f->%.3f\n",
-                sBefore, sAfter, rBefore, rAfter);
+    params->get_value(plug, P_STAGES, &stAfter);
+    std::printf("state roundtrip: size %.0f->%.0f  ratio %.3f->%.3f  stages %.0f->%.0f\n",
+                sBefore, sAfter, rBefore, rAfter, stBefore, stAfter);
     CHECK(std::fabs(sAfter - sBefore) < 1e-6 && std::fabs(rAfter - rBefore) < 1e-6);
+    CHECK(std::fabs(stAfter - stBefore) < 1e-6);
   }
 
   // ---- mono mode: L and R outputs identical, driven by L input only ----

@@ -25,6 +25,7 @@ Klingeln, sondern ein dichter Wash.
 | Tone      | 0 … 100 %    | Tone               | Tilt-Filter um 700 Hz (LP↔HP). 50 % neutral, <50 dunkel, >50 hell |
 | Mix       | 0 … 100 %    | Dry/Wet            | lineare Dry/Wet-Blende |
 | Ratio     | 1.20 … 2.00  | goldener Schnitt   | Delay-Verhältnis, Default **1.618 (φ)**. Weg von φ bricht die Hall-Illusion bewusst (Manual S. 8/17) |
+| Stages    | 512/1024/2048/4096 | BBD-Chip     | nachgebildete BBD-Stufenzahl. Weniger Stufen = niedrigere Clock bei gleicher Zeit = dunkler/körniger **unabhängig von der Raumgröße** (wie ein kleinerer Chip). Default **2048** (Chip des Kits) |
 | Mode      | Stereo / Mono| —                  | **Mono** = nur ein Kanal (nicht summiert), Ausgang = Delay-A-Tap auf beide Seiten, wie das Mono-Eurorack-Modul. **Stereo** = A→L / B→R |
 
 Alle Parameter sind host-automatisier- und -modulierbar; der komplette Zustand
@@ -40,9 +41,10 @@ wird über die `clap.state`-Extension gespeichert/geladen.
 
 Recherchierter BBD-Charakter (nicht nur ein Tiefpass):
 
-- **Clock-Rate-Sample&Hold pro Line** (`f_clk = 2048 / Delayzeit`, room-abhängig)
-  → Bandbegrenzung **und Aliasing** als *gewollter* Teil des Klangs. Große Räume
-  takten langsamer → körniger/dunkler, kleine Räume heller.
+- **Clock-Rate-Sample&Hold pro Line** (`f_clk = Stages / Delayzeit`, room- *und*
+  `Stages`-abhängig) → Bandbegrenzung **und Aliasing** als *gewollter* Teil des
+  Klangs. Große Räume takten langsamer → körniger/dunkler; weniger `Stages`
+  macht es körnig über den ganzen Size-Bereich (Grit entkoppelt von der Größe).
 - **2-poliges Rekonstruktionsfilter im Feedback** → dunkel, und das Abdunkeln
   **kumuliert über jede Wiederholung** (die BBD-„warmth"). Eckfrequenz an die
   Clock gekoppelt, hart gedeckelt (~900 Hz … 5,2 kHz).
@@ -82,14 +84,14 @@ nicht im Repo). Ergebnis ist ein `.clap`-Bundle (macOS, Universal arm64+x86_64).
 ## Test
 
 `test/test_host.cpp` ist ein minimaler CLAP-Host, der das Plugin lädt und prüft:
-7 Parameter + Stereo-Ports, Ratio-Default = φ, Impulsantwort endlich mit Tail auf
+8 Parameter + Stereo-Ports, Ratio-Default = φ, Impulsantwort endlich mit Tail auf
 beiden Kanälen, **Stabilität bei Decay = 100 %** (Ausgang bleibt beschränkt),
 **Mono-Mode** (beide Ausgänge exakt identisch), und State-Roundtrip.
 Start über `./build.sh test`.
 
 ## Status
 
-v1.1 — Build + Smoke-Tests grün. BBD-Lo-Fi-Kern überarbeitet (Clock-S&H/Aliasing,
+v1.2 — Build + Smoke-Tests grün. BBD-Lo-Fi-Kern überarbeitet (Clock-S&H/Aliasing,
 2-poliges Rekonstruktionsfilter, Companding-Atmen, Drive) + Mono/Stereo-Switch.
 In einem echten CLAP-Host (Bitwig, Reaper …) noch nicht gegengehört.
 
