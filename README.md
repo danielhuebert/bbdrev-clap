@@ -1,103 +1,131 @@
-# BBD Reverb — CLAP audio effect
+# BBD Reverb
 
-Analoger-BBD-Hall (mki x es.edu / Moritz Klein) als Desktop-[CLAP](https://cleveraudio.org)-Plugin.
-Port des minilogue xd `bbd rev` revfx — gleicher DSP-Kern (zwei Delaylines im
-goldenen Schnitt, kreuzgekoppelt über eine verlustfreie 2×2-**Hadamard-Feedback-
-matrix mit einem Minuszeichen**), angepasst an CLAPs variable Samplerate und
-nicht-interleavte `float**`-Buffer — **diesmal mit allen im Manual genannten
-Parametern**.
+An analog-style **bucket-brigade reverb** as a desktop [CLAP](https://cleveraudio.org)
+audio effect (macOS, universal arm64 + x86_64).
+
+It reimplements the DSP idea behind the **mki x es.edu *analog reverb*** DIY kit by
+**[Moritz Klein](https://www.youtube.com/@MoritzKlein0)** and
+**[Erica Synths](https://www.ericasynths.lv/)**: a reverb built from just **two delay
+lines** tuned to the **golden ratio**, cross-coupled through a lossless 2×2
+**Hadamard feedback matrix with a single minus sign**. That one minus sign cancels
+coinciding echoes, which is what turns two flutter echoes into a dense, smooth wash
+instead of a metallic ring.
 
 ```
 [ A_in ]   [ -1  +1 ] [ A_out ]
 [ B_in ] = [ +1  +1 ] [ B_out ] · g      (g = Decay)
 ```
 
-Das Minuszeichen (`-a + b`) löscht koinzidente Echos aus → kein metallisches
-Klingeln, sondern ein dichter Wash.
+This is a port of my own minilogue xd `bbd rev` user effect to CLAP — same core,
+adapted to CLAP's variable sample rate and non-interleaved `float**` buffers, and
+extended with every control the original module exposes.
 
-## Parameter
+> Independent, unofficial project. Not affiliated with or endorsed by Erica Synths
+> or Moritz Klein. See [Credits](#credits).
 
-| Parameter | Range        | Modul-Entsprechung | Notiz |
-|-----------|--------------|--------------------|-------|
-| Input     | 0 … 200 %    | Input Gain         | Pegel/Drive in den Hall (nur Wet-Pfad) |
-| Size      | 0 … 100 %    | Room Size (Hero)   | beide Delaylängen (~2,5 … 90 ms), Verhältnis = Ratio. Klein = heller/metallischer Flutter, groß = dunkler, körnig |
-| Decay     | 0 … 100 %    | Decay              | Feedback-Gain / Tail-Länge. Nie 0 (Floor), Max nahe Selbstoszillation |
-| Tone      | 0 … 100 %    | Tone               | Tilt-Filter um 700 Hz (LP↔HP). 50 % neutral, <50 dunkel, >50 hell |
-| Mix       | 0 … 100 %    | Dry/Wet            | lineare Dry/Wet-Blende |
-| Ratio     | 1.20 … 2.00  | goldener Schnitt   | Delay-Verhältnis, Default **1.618 (φ)**. Weg von φ bricht die Hall-Illusion bewusst (Manual S. 8/17) |
-| Stages    | 512/1024/2048/4096 | BBD-Chip     | nachgebildete BBD-Stufenzahl. Weniger Stufen = niedrigere Clock bei gleicher Zeit = dunkler/körniger **unabhängig von der Raumgröße** (wie ein kleinerer Chip). Default **2048** (Chip des Kits) |
-| Mode      | Stereo / Mono| —                  | **Mono** = nur ein Kanal (nicht summiert), Ausgang = Delay-A-Tap auf beide Seiten, wie das Mono-Eurorack-Modul. **Stereo** = A→L / B→R |
+## Parameters
 
-Alle Parameter sind host-automatisier- und -modulierbar; der komplette Zustand
-wird über die `clap.state`-Extension gespeichert/geladen.
+| Parameter | Range                | Module control | Notes |
+|-----------|----------------------|----------------|-------|
+| Input     | 0 … 200 %            | Input Gain     | drive into the reverb (affects the wet path only) |
+| Size      | 0 … 100 %            | Room Size      | both delay lengths (~2.5 … 90 ms), ratio set by *Ratio*. Small = brighter / metallic flutter, large = darker, grainier |
+| Decay     | 0 … 100 %            | Decay          | feedback gain / tail length. Never fully 0, max is near self-oscillation |
+| Tone      | 0 … 100 %            | Tone           | tilt filter around 700 Hz (LP↔HP). 50 % is neutral, below = darker, above = brighter |
+| Mix       | 0 … 100 %            | Dry/Wet        | linear dry/wet blend |
+| Ratio     | 1.20 … 2.00          | golden ratio   | delay ratio, default **1.618 (φ)**. Moving away from φ deliberately breaks the reverb illusion into discrete/ringing echoes |
+| Stages    | 512 / 1024 / 2048 / 4096 | BBD chip   | emulated BBD stage count. Fewer stages = lower clock at the same delay time = darker / grainier **regardless of room size** (like a smaller BBD chip). Default **2048** |
+| Mode      | Stereo / Mono        | —              | **Mono** = single input channel (not summed), output = the delay-A tap on both sides, like the mono Eurorack module. **Stereo** = A→L / B→R |
 
-- **Stereo:** Delay A → links, Delay B → rechts (natürliche Breite), Eingang =
-  Mono-Summe, Dry-Pfad pro Kanal erhalten.
-- **Mono** (wie die Hardware): Eingang = nur der linke Kanal (nicht summiert),
-  Ausgang = Delay-A-Tap (enthält via Kreuzkopplung bereits beide Delays),
-  identisch auf beide Kanäle.
+All parameters are host-automatable; the six continuous ones (Input, Size, Decay,
+Tone, Mix, Ratio) are also host-**modulatable**. The full state is saved/restored
+through the `clap.state` extension.
 
-## Authentischer BBD-Lo-Fi
+- **Stereo:** delay A → left, delay B → right (natural width); the reverb core
+  processes the mono sum of the input, the dry path stays per channel.
+- **Mono** (like the hardware): input is the left channel only (not summed); the
+  output is the delay-A tap — which already contains both delays via the
+  cross-coupling — fed identically to both channels.
 
-Recherchierter BBD-Charakter (nicht nur ein Tiefpass):
+## The BBD lo-fi character
 
-- **Clock-Rate-Sample&Hold pro Line** (`f_clk = Stages / Delayzeit`, room- *und*
-  `Stages`-abhängig) → Bandbegrenzung **und Aliasing** als *gewollter* Teil des
-  Klangs. Große Räume takten langsamer → körniger/dunkler; weniger `Stages`
-  macht es körnig über den ganzen Size-Bereich (Grit entkoppelt von der Größe).
-- **2-poliges Rekonstruktionsfilter im Feedback** → dunkel, und das Abdunkeln
-  **kumuliert über jede Wiederholung** (die BBD-„warmth"). Eckfrequenz an die
-  Clock gekoppelt, hart gedeckelt (~900 Hz … 5,2 kHz).
-- **Companding-„Atmen":** Rauschflur, dessen Pegel der Signal-Hüllkurve folgt
-  (fast attack / slow release) — der Hiss schwillt mit dem Signal an und zieht
-  sich in Pausen zurück, das typische BBD-Pumpen.
-- **Drive + weiche Sättigung** (kubischer Softclip) für die Nichtlinearität.
-- **Re-Pitching:** Size-/Ratio-Änderungen gleiten in der Tonhöhe (BBD-typisch,
-  gewollt — anders als beim `snes-delay`-CLAP, der per Crossfade entglittet).
+A bucket-brigade delay does not just low-pass the signal. Its recognizable sound
+comes from four things, all modelled here:
 
-Der trockene Pfad bleibt voll bandbreitig; nur der Hall ist lo-fi.
+- **Clock-rate sample & hold per line** (`f_clk = Stages / delay-time`, so it
+  depends on both *Size* and *Stages*) → band-limiting **and aliasing** as a
+  *wanted* part of the sound. Larger rooms (and fewer stages) clock slower →
+  grainier and darker.
+- **A 2-pole reconstruction low-pass inside the feedback loop** → dark, and the
+  darkening **compounds on every repeat** (the classic BBD "warmth"). Its corner
+  tracks the clock, hard-capped (~0.9 … 5.2 kHz).
+- **Companding "breathing":** a noise floor whose level follows the signal
+  envelope (fast attack / slow release) — the hiss swells with the signal and
+  ducks back in the gaps, the typical BBD pumping.
+- **Drive + soft (cubic) saturation** for the nonlinearity.
 
-**Was digital gratis besser ist als in der Schaltung:** `len_b = len_a / Ratio`
-ist exakt — kein Ratio-Trimmer-Drift, keine VCA-Matching-Trimmer, keine
-Clock-Kennlinien-Kalibrierung (im Manual „locking the ratio" S. 30–36).
+The dry path stays full-bandwidth; only the reverb is lo-fi.
 
-## Bauen
+**What comes for free versus the analog circuit:** `len_b = len_a / Ratio` is
+*exact*, so there is no clock-ratio drift to trim, no VCA matching, and no
+oscillator-curve calibration — the parts the kit documentation spends the most
+effort on ("locking the ratio").
 
-**Nur clang (kein CMake nötig):**
+## Build
+
+**Just clang (no CMake needed):**
 
 ```sh
-./build.sh          # Universal-Bundle build/"BBD Reverb.clap"
-./build.sh install  # + nach ~/Library/Audio/Plug-Ins/CLAP kopieren
-./build.sh test     # + Smoke-Test-Host bauen & laufen lassen
+./build.sh          # universal bundle  build/"BBD Reverb.clap"
+./build.sh install  # + copy to ~/Library/Audio/Plug-Ins/CLAP
+./build.sh test     # + build & run the smoke-test host
 ```
 
-**Oder CMake:**
+**Or CMake:**
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Die CLAP-Header werden beim ersten Build nach `deps/clap/` geklont (Tag 1.2.10,
-nicht im Repo). Ergebnis ist ein `.clap`-Bundle (macOS, Universal arm64+x86_64).
+The CLAP headers are cloned into `deps/clap/` on first build (tag 1.2.10) and are
+not committed. The result is a `.clap` bundle (macOS, universal arm64 + x86_64).
 
 ## Test
 
-`test/test_host.cpp` ist ein minimaler CLAP-Host, der das Plugin lädt und prüft:
-8 Parameter + Stereo-Ports, Ratio-Default = φ, Impulsantwort endlich mit Tail auf
-beiden Kanälen, **Stabilität bei Decay = 100 %** (Ausgang bleibt beschränkt),
-**Mono-Mode** (beide Ausgänge exakt identisch), und State-Roundtrip.
-Start über `./build.sh test`.
+`test/test_host.cpp` is a minimal CLAP host that loads the plugin and checks:
+8 parameters + stereo ports, the `Ratio` default reading as φ and `Stages` as the
+chip values, a finite impulse response with a tail on both channels, **stability at
+Decay = 100 %** (the output stays bounded), **Mono mode** (both outputs identical),
+**parameter modulation** via `CLAP_EVENT_PARAM_MOD`, and a state save/load
+round-trip. Run it with `./build.sh test`.
+
+## Credits
+
+The DSP concept, the signal flow, and the parameter set all come from the
+**mki x es.edu *analog reverb*** DIY kit, designed and documented by
+**Moritz Klein** and **Erica Synths**. Their kit documentation — the full
+schematic plus the design rationale behind every stage — was the reference used to
+derive this port. Huge thanks to them for making analog circuit design this
+approachable; if you want to understand *why* the two-delays-and-a-minus-sign trick
+works, their material is the place to start.
+
+- Moritz Klein — https://www.youtube.com/@MoritzKlein0
+- Erica Synths (mki x es.edu DIY kits) — https://www.ericasynths.lv/shop/diy-kits-1/
+
+The kit documentation itself is **not** included in this repository. Please get the
+kit from Erica Synths to support their educational work.
+
+Sister projects:
+- minilogue xd `bbd rev` — the original logue-SDK `revfx` this was ported from.
+- [`clap-snes-delay`](https://github.com/danielhuebert) — the SPC Echo CLAP that
+  provided the plugin scaffolding.
+
+## License
+
+MIT — see [LICENSE](LICENSE). This covers the code in this repository only; the
+mki x es.edu kit and its documentation remain the property of their authors.
 
 ## Status
 
-v1.2 — Build + Smoke-Tests grün. BBD-Lo-Fi-Kern überarbeitet (Clock-S&H/Aliasing,
-2-poliges Rekonstruktionsfilter, Companding-Atmen, Drive) + Mono/Stereo-Switch.
-In einem echten CLAP-Host (Bitwig, Reaper …) noch nicht gegengehört.
-
-## Herkunft
-
-- DSP-Prinzip & Parameter: DIY-Kit-Manual des **mki x es.edu analog reverb**
-  (Moritz Klein × Erica Synths). Das Manual selbst ist nicht Teil dieses Repos.
-- Schwesterprojekte: minilogue xd `bbdrev` (revfx), `clap-snes-delay` (SPC Echo,
-  CLAP-Vorlage), `amrm-clap`.
+Working and verified in Bitwig (parameters, automation and modulation). Smoke tests
+green. If you try it in other hosts, feedback is welcome.
