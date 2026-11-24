@@ -4,27 +4,33 @@
 // DSP-Kern: zwei Delaylines im Verhaeltnis des goldenen Schnitts, kreuzgekoppelt
 // ueber eine verlustfreie 2x2-Hadamard-Feedbackmatrix mit EINEM Minuszeichen
 // (-a + b), das koinzidente Echos ausloescht und das metallische Klingeln
-// verhindert. Angepasst von der festen 48-kHz-/interleaved-Umgebung des logue
-// SDK auf CLAPs variable Samplerate und nicht-interleavte (float**) Buffer.
+// verhindert.
 //
 //   [ A_in ]   [ -1  +1 ] [ A_out ]
 //   [ B_in ] = [ +1  +1 ] [ B_out ] * g        (g = Decay)
 //
-// Diesmal mit ALLEN im DIY-Kit-Manual genannten Parametern (das echte Modul):
-//   Input    0 .. 200 %   Eingangspegel/Drive in den Hall (Modul-"Input Gain")
+// Alle im DIY-Kit-Manual genannten Parameter des echten Moduls:
+//   Input    0 .. 200 %   Eingangspegel/Drive in den Hall
 //   Size     0 .. 100 %   Room Size (beide Delaylaengen, Verhaeltnis = Ratio)
 //   Decay    0 .. 100 %   Feedback-Gain / Tail-Laenge (nie 0, Max nahe Selbstosz.)
-//   Tone     0 .. 100 %   Tilt-Filter um 700 Hz (LP<->HP), <50 dunkel, >50 hell
+//   Tone     0 .. 100 %   Tilt-Filter um 700 Hz (LP<->HP), 50 % neutral
 //   Mix      0 .. 100 %   Dry/Wet
-//   Ratio   1.20 .. 2.00  Delay-Verhaeltnis, Default 1.618 (goldener Schnitt).
-//                         Weg von Phi bricht die Illusion bewusst (Manual S. 8/17).
+//   Ratio   1.20 .. 2.00  Delay-Verhaeltnis, Default 1.618 (goldener Schnitt)
+//   Mode     Stereo|Mono  Mono = ein Kanal (nicht summiert), Ausgang = Delay-A-
+//                         Tap auf beide Seiten (wie das Mono-Eurorack-Modul)
 //
-// Authentischer BBD-Lo-Fi: room-size-abhaengiges Clock/2-Bandlimit pro Line
-// (fc = 2048/(4*t)), sanfte Saettigung + dezenter Grit beim Zurueckschreiben.
-// Room-Size-/Ratio-Aenderungen gleiten in der Tonhoehe (BBD-typisch, gewollt).
+// --- Authentischer BBD-Lo-Fi (recherchierter Charakter) ---
+//   * Clock-Rate-Sample&Hold pro Line (f_clk = 2048 Stufen / Delayzeit), room-
+//     abhaengig -> Bandbegrenzung + ALIASING (gewollter BBD-Grit).
+//   * 2-poliges Rekonstruktions-Tiefpassfilter im Loop -> dunkel, und das
+//     Abdunkeln KUMULIERT ueber jede Wiederholung (BBD-"warmth").
+//   * Companding-"Atmen": Rauschflur, dessen Pegel der Signal-Huellkurve folgt
+//     (Hiss schwillt mit dem Signal an, zieht sich in Pausen zurueck).
+//   * Drive + weiche Saettigung (Nichtlinearitaet).
+//   Trockener Pfad bleibt voll bandbreitig; nur der Hall ist lo-fi.
 //
-// Alle Parameter sind host-automatisierbar; der Zustand wird via clap.state
-// gespeichert/geladen. Build: siehe CMakeLists.txt oder build.sh (-> .clap).
+// Alle Parameter sind host-automatisier-/modulierbar; Zustand via clap.state.
+// Build: siehe CMakeLists.txt oder build.sh (-> .clap).
 
 #include <clap/clap.h>
 
@@ -38,7 +44,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// DSP-Konstanten (wie im minilogue-xd-Original)
+// DSP-Konstanten
 // ---------------------------------------------------------------------------
 
 static constexpr double kSizeMsMin = 2.5;    // kleiner Raum / metallischer Flutter
@@ -50,15 +56,25 @@ static constexpr double kRatioPhi = 1.6180339887;  // goldener Schnitt (Default)
 static constexpr float kGMin = 0.25f;        // Decay-Floor (nie ganz aus)
 static constexpr float kGMax = 0.686f;       // g*sqrt(2) ~ 0.97, stabil
 
-// BBD-Bandlimit: fc = N/(4*t) mit N=2048. One-Pole-Koeff a = 1 - exp(-2*pi*fc/fs).
-// Der Exponent ist samplerate-unabhaengig in Samples: 2*pi*fc/fs = 2*pi*512/len.
-static constexpr float kBbdWNum = 3217.0f;   // 2*pi * 512
-static constexpr float kBlAMin = 0.05f;      // untere Schranke (max. Daempfung)
+static constexpr float kBbdStages = 2048.f;  // BBD-Stufen -> f_clk = Stages/Delayzeit
 
-static constexpr float kToneFcHz = 700.0f;   // Tilt-Pivot (Manual S. 26)
-static constexpr float kSoftclipC = 0.10f;   // Saettigungsstaerke (0..1/3)
-static constexpr float kGritAmt = 0.00035f;  // Rauschflur-Pegel
+// Rekonstruktions-/Anti-Alias-Tiefpass: Eckfrequenz = Bruchteil der Clock,
+// hart gedeckelt -> auch kleine Raeume bleiben dunkel (BBD-typisch).
+static constexpr float kLpClockFrac = 0.30f;
+static constexpr float kLpMaxHz = 5200.f;
+static constexpr float kLpMinHz = 900.f;
+
+static constexpr float kToneFcHz = 700.f;    // Tilt-Pivot (Manual S. 26)
+static constexpr float kDrive = 1.4f;        // Eingangs-Drive in die S(aettigung)
+static constexpr float kSoftclipC = 0.12f;   // Saettigungsstaerke (0..1/3)
+
+// Companding-"Atmen": Rauschflur + huellkurvengefuehrter Anteil.
+static constexpr float kHissFloor = 0.0006f; // konstanter Grundhiss (~ -64 dB)
+static constexpr float kHissMod = 0.006f;    // mit dem Signal atmender Anteil
+
 static constexpr double kSmoothTauS = 0.010; // Parameter-Glaettung (Re-Pitch-Feel)
+static constexpr double kEnvAtkS = 0.003;    // Huellkurve Attack (3 ms)
+static constexpr double kEnvRelS = 0.120;    // Huellkurve Release (120 ms, Tail)
 
 static inline float clip1m1f(float x) {
   return x < -1.f ? -1.f : (x > 1.f ? 1.f : x);
@@ -79,11 +95,13 @@ enum {
   kParamTone = 3,   // percent (0..100), 50 = neutral
   kParamMix = 4,    // percent (0..100)
   kParamRatio = 5,  // 1.20..2.00
-  kParamCount = 6,
+  kParamMode = 6,   // stepped: 0 = Stereo, 1 = Mono
+  kParamCount = 7,
 };
 
 static const clap_id kParamOrder[kParamCount] = {
-    kParamInput, kParamSize, kParamDecay, kParamTone, kParamMix, kParamRatio};
+    kParamInput, kParamSize, kParamDecay, kParamTone,
+    kParamMix,   kParamRatio, kParamMode};
 
 // ---------------------------------------------------------------------------
 // Plugin-Instanz
@@ -93,39 +111,44 @@ struct BbdReverb {
   clap_plugin_t plugin;  // muss zuerst stehen; Host haelt Pointer hierauf
   const clap_host_t *host = nullptr;
 
-  // Parameterwerte in Anzeige-Einheiten. Atomic, damit Main- und Audio-Thread
-  // nie einen Wert zerreissen.
   std::atomic<double> p_input{100.0};
   std::atomic<double> p_size{50.0};
   std::atomic<double> p_decay{50.0};
   std::atomic<double> p_tone{50.0};
   std::atomic<double> p_mix{50.0};
   std::atomic<double> p_ratio{kRatioPhi};
+  std::atomic<double> p_mode{0.0};  // 0 = Stereo, 1 = Mono
 
-  // Verarbeitungszustand (nur Audio-Thread, wenn aktiv).
   double sample_rate = 48000.0;
   std::vector<float> buf_a;
   std::vector<float> buf_b;
-  uint32_t max_len = 0;   // allokierte Laenge (>= 90 ms + Guard)
-  uint32_t wpos = 0;      // gemeinsamer Schreibkopf (Wrap-Punkt bewegt sich nie)
+  uint32_t max_len = 0;
+  uint32_t wpos = 0;
 
   // Geglaettete Laufwerte
-  float s_len_a = 0.f;    // Delaylaenge A in Samples
-  float s_g = 0.5f;       // Feedback-Gain
-  float s_mix = 0.5f;     // Dry/Wet
-  float s_tone = 0.5f;    // 0..1
-  float s_gain = 1.f;     // Input-Gain linear
+  float s_len_a = 0.f;
+  float s_g = 0.5f;
+  float s_mix = 0.5f;
+  float s_tone = 0.5f;
+  float s_gain = 1.f;
   float s_ratio = (float)kRatioPhi;
 
-  // Filterzustaende
-  float bl_a = 0.f;       // BBD-Bandlimit A
-  float bl_b = 0.f;       // BBD-Bandlimit B
-  float tone_lp = 0.f;    // Tone-Tiefpass (700 Hz)
-  float tone_k = 0.1f;    // Tone-LP-Koeff (aus sr)
-  float smooth_k = 0.002f;// Glaettungskoeff (aus sr)
+  // BBD-Clock-Sample&Hold pro Line
+  float phase_a = 0.f, phase_b = 0.f;
+  float held_a = 0.f, held_b = 0.f;
+  // 2-polige Rekonstruktions-Tiefpaesse pro Line
+  float lpa1 = 0.f, lpa2 = 0.f, lpb1 = 0.f, lpb2 = 0.f;
+  // Tone-Tilt + Companding-Huellkurve
+  float tone_lp = 0.f;
+  float env = 0.f;
 
-  uint32_t rng = 0x12345678u;  // xorshift fuer den Grit
+  // Koeffizienten aus der Samplerate
+  float tone_k = 0.1f;
+  float smooth_k = 0.002f;
+  float env_atk = 0.1f;
+  float env_rel = 0.01f;
 
+  uint32_t rng = 0x12345678u;
   inline float white() {
     uint32_t x = rng;
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
@@ -133,7 +156,6 @@ struct BbdReverb {
     return (float)((int32_t)x) * 4.6566129e-10f;
   }
 
-  // Ziel-Delaylaenge A (Samples) aus dem Size-Poti.
   float sizeTargetSamples() const {
     const double v = p_size.load(std::memory_order_relaxed) * 0.01;
     const double ms = kSizeMsMin + v * (kSizeMsMax - kSizeMsMin);
@@ -144,19 +166,22 @@ struct BbdReverb {
     return d;
   }
 
-  // BBD-Bandlimit-Koeffizient fuer eine Delaylaenge (One-Pole-LP).
-  static inline float bbdCoeff(float len) {
-    if (len < 1.f) len = 1.f;
-    const float a = 1.f - std::exp(-kBbdWNum / len);
-    return a < kBlAMin ? kBlAMin : (a > 1.f ? 1.f : a);
+  // One-Pole-Koeffizient fuer eine Eckfrequenz (Hz).
+  float lpCoeff(float fc) const {
+    if (fc < kLpMinHz) fc = kLpMinHz;
+    if (fc > kLpMaxHz) fc = kLpMaxHz;
+    return 1.f - (float)std::exp(-2.0 * M_PI * fc / sample_rate);
   }
 
   void clearState() {
     std::fill(buf_a.begin(), buf_a.end(), 0.f);
     std::fill(buf_b.begin(), buf_b.end(), 0.f);
     wpos = 0;
-    bl_a = bl_b = tone_lp = 0.f;
-    // Glaettung direkt auf die aktuellen Potiwerte setzen (kein Anfahr-Sweep).
+    phase_a = phase_b = 0.f;
+    held_a = held_b = 0.f;
+    lpa1 = lpa2 = lpb1 = lpb2 = 0.f;
+    tone_lp = 0.f;
+    env = 0.f;
     s_len_a = sizeTargetSamples();
     s_g = kGMin + (float)(p_decay.load() * 0.01) * (kGMax - kGMin);
     s_mix = (float)(p_mix.load() * 0.01);
@@ -184,16 +209,18 @@ struct BbdReverb {
     const float tone_t = (float)(p_tone.load(std::memory_order_relaxed) * 0.01);
     const float gain_t = (float)(p_input.load(std::memory_order_relaxed) * 0.01);
     const float ratio_t = (float)p_ratio.load(std::memory_order_relaxed);
+    const bool mono = p_mode.load(std::memory_order_relaxed) >= 0.5;
 
-    // Bandlimit-Koeffs einmal pro Block aus den aktuellen Laengen.
-    const float len_b_blk = s_len_a / s_ratio;
-    const float bl_ka = bbdCoeff(s_len_a);
-    const float bl_kb = bbdCoeff(len_b_blk);
+    // Filter-Eckfrequenzen einmal pro Block aus den aktuellen Clocks.
+    // f_clk[Hz] = 2048 * fs / len ; corner = clamp(f_clk * frac).
+    const float fs = (float)sample_rate;
+    const float len_b0 = s_len_a / s_ratio;
+    const float lp_ka = lpCoeff((kBbdStages * fs / s_len_a) * kLpClockFrac);
+    const float lp_kb = lpCoeff((kBbdStages * fs / len_b0) * kLpClockFrac);
     const uint32_t maxd = max_len;
     const float sk = smooth_k;
 
     for (uint32_t i = 0; i < n; ++i) {
-      // Parameter glaetten (Size/Ratio -> leichtes Re-Pitching, gewollt)
       s_len_a += sk * (len_a_t - s_len_a);
       s_g     += sk * (g_t     - s_g);
       s_mix   += sk * (mix_t   - s_mix);
@@ -206,36 +233,58 @@ struct BbdReverb {
       const float dryL = inL[i];
       const float dryR = inR[i];
 
-      // Eingang: Mono-Summe * Input-Gain
-      const float mono = 0.5f * (dryL + dryR) * s_gain;
+      // Eingang: Mono = nur ein Kanal (nicht summiert), Stereo = Summe.
+      const float src = mono ? dryL : 0.5f * (dryL + dryR);
+      const float scaled = src * s_gain;
 
-      // Tone-Tilt um 700 Hz: out = gLow*LP + gHigh*HP, bei 0.5 unity (LP+HP=x)
-      tone_lp += tone_k * (mono - tone_lp);
-      const float hp = mono - tone_lp;
-      const float in = 2.f * (1.f - s_tone) * tone_lp + 2.f * s_tone * hp;
+      // Tone-Tilt um 700 Hz (bei 50 % unity, da LP+HP = x)
+      tone_lp += tone_k * (scaled - tone_lp);
+      const float hp = scaled - tone_lp;
+      const float inj = 2.f * (1.f - s_tone) * tone_lp + 2.f * s_tone * hp;
 
-      // Delayline-Ausgaenge lesen + BBD-Bandlimit
-      const float rd_a = readInterp(buf_a, s_len_a);
-      const float rd_b = readInterp(buf_b, len_b);
-      bl_a += bl_ka * (rd_a - bl_a);
-      bl_b += bl_kb * (rd_b - bl_b);
-      const float a = bl_a;
-      const float b = bl_b;
+      // Companding-Huellkurve (fast attack / slow release) fuer das Atmen
+      const float ax = std::fabs(inj);
+      env += (ax > env ? env_atk : env_rel) * (ax - env);
+
+      // BBD-Clock-Sample&Hold der Delay-Ausgaenge (Aliasing + Bandbegrenzung).
+      // Phaseninkrement = f_clk/fs = 2048/len. Bei len > 2048 (grosse Raeume)
+      // < 1 Tick/Sample -> ZOH-Stufen; bei kleinen Raeumen jede Probe neu.
+      const float inc_a = kBbdStages / s_len_a;
+      const float inc_b = kBbdStages / len_b;
+      phase_a += inc_a;
+      if (phase_a >= 1.f) { phase_a -= std::floor(phase_a); held_a = readInterp(buf_a, s_len_a); }
+      phase_b += inc_b;
+      if (phase_b >= 1.f) { phase_b -= std::floor(phase_b); held_b = readInterp(buf_b, len_b); }
+
+      // 2-poliges Rekonstruktionsfilter -> dunkel, kumuliert ueber Repeats.
+      lpa1 += lp_ka * (held_a - lpa1); lpa2 += lp_ka * (lpa1 - lpa2);
+      lpb1 += lp_kb * (held_b - lpb1); lpb2 += lp_kb * (lpb1 - lpb2);
+      const float a = lpa2;
+      const float b = lpb2;
 
       // Hadamard-Feedback mit dem Minuszeichen
       const float fb_a = s_g * (-a + b);
       const float fb_b = s_g * ( a + b);
 
-      const float grit = kGritAmt * white();
+      // atmendes Companding-Rauschen
+      const float noise = (kHissFloor + kHissMod * env) * white();
 
-      buf_a[wpos] = softclipf(kSoftclipC, in + fb_a + grit);
-      buf_b[wpos] = softclipf(kSoftclipC, in + fb_b + grit);
+      // Drive nur auf die Einspeisung (Feedback bleibt stabil), weiche Saettigung
+      buf_a[wpos] = softclipf(kSoftclipC, kDrive * inj + fb_a + noise);
+      buf_b[wpos] = softclipf(kSoftclipC, kDrive * inj + fb_b + noise);
 
       if (++wpos >= maxd) wpos = 0;
 
-      // Ausgang: A -> links, B -> rechts (natuerliche Stereobreite)
-      outL[i] = clip1m1f(dryL + s_mix * (a - dryL));
-      outR[i] = clip1m1f(dryR + s_mix * (b - dryR));
+      if (mono) {
+        // wie die Hardware: ein Ausgang = Delay-A-Tap (enthaelt via Kreuz-
+        // kopplung bereits beide Delays), identisch auf beide Kanaele.
+        const float o = clip1m1f(dryL + s_mix * (a - dryL));
+        outL[i] = o;
+        outR[i] = o;
+      } else {
+        outL[i] = clip1m1f(dryL + s_mix * (a - dryL));
+        outR[i] = clip1m1f(dryR + s_mix * (b - dryR));
+      }
     }
   }
 };
@@ -256,9 +305,9 @@ static const clap_plugin_descriptor_t s_descriptor = {
     "https://github.com/danielhuebert",
     "",
     "",
-    "1.0.0",
+    "1.1.0",
     "Analoger-BBD-Hall: zwei Delays im goldenen Schnitt + Hadamard-Feedback mit "
-    "einem Minuszeichen (mki x es.edu / Moritz Klein).",
+    "einem Minuszeichen, mit BBD-Lo-Fi (mki x es.edu / Moritz Klein).",
     s_features,
 };
 
@@ -327,6 +376,12 @@ static bool pr_get_info(const clap_plugin_t *, uint32_t index,
       info->min_value = kRatioMin; info->max_value = kRatioMax;
       info->default_value = kRatioPhi;
       return true;
+    case kParamMode:
+      info->id = kParamMode;
+      info->flags = CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_AUTOMATABLE;
+      std::snprintf(info->name, sizeof(info->name), "Mode");
+      info->min_value = 0.0; info->max_value = 1.0; info->default_value = 0.0;
+      return true;
     default:
       return false;
   }
@@ -341,6 +396,7 @@ static bool pr_get_value(const clap_plugin_t *plugin, clap_id id, double *out) {
     case kParamTone:  *out = self->p_tone.load();  return true;
     case kParamMix:   *out = self->p_mix.load();   return true;
     case kParamRatio: *out = self->p_ratio.load(); return true;
+    case kParamMode:  *out = self->p_mode.load();  return true;
   }
   return false;
 }
@@ -359,13 +415,20 @@ static bool pr_value_to_text(const clap_plugin_t *, clap_id id, double value,
       else
         std::snprintf(out, cap, "%.3f", value);
       return true;
+    case kParamMode:
+      std::snprintf(out, cap, "%s", value >= 0.5 ? "Mono" : "Stereo");
+      return true;
   }
   return false;
 }
 
-static bool pr_text_to_value(const clap_plugin_t *, clap_id, const char *text,
+static bool pr_text_to_value(const clap_plugin_t *, clap_id id, const char *text,
                              double *out) {
   if (!text) return false;
+  if (id == kParamMode) {
+    *out = (text[0] == 'M' || text[0] == 'm' || std::atof(text) >= 0.5) ? 1.0 : 0.0;
+    return true;
+  }
   *out = std::atof(text);
   return true;
 }
@@ -378,6 +441,7 @@ static void applyParamEvent(BbdReverb *self, const clap_event_param_value_t *ev)
     case kParamTone:  self->p_tone.store(std::clamp(ev->value, 0.0, 100.0)); break;
     case kParamMix:   self->p_mix.store(std::clamp(ev->value, 0.0, 100.0)); break;
     case kParamRatio: self->p_ratio.store(std::clamp(ev->value, kRatioMin, kRatioMax)); break;
+    case kParamMode:  self->p_mode.store(ev->value >= 0.5 ? 1.0 : 0.0); break;
     default: break;
   }
 }
@@ -399,10 +463,10 @@ static const clap_plugin_params_t s_params = {
     pr_value_to_text, pr_text_to_value, pr_flush};
 
 // ---------------------------------------------------------------------------
-// state — alle 6 Parameterwerte serialisieren
+// state — alle 7 Parameterwerte serialisieren
 // ---------------------------------------------------------------------------
 
-static const uint32_t kStateMagic = 0x42425231;  // 'BBR1'
+static const uint32_t kStateMagic = 0x42425232;  // 'BBR2'
 
 static bool writeAll(const clap_ostream_t *os, const void *p, uint64_t n) {
   const uint8_t *b = (const uint8_t *)p;
@@ -425,24 +489,25 @@ static bool readAll(const clap_istream_t *is, void *p, uint64_t n) {
   return true;
 }
 
-// Layout: magic, dann 6 doubles: input, size, decay, tone, mix, ratio.
+// Layout: magic, dann 7 doubles: input, size, decay, tone, mix, ratio, mode.
 static bool st_save(const clap_plugin_t *plugin, const clap_ostream_t *os) {
   auto *self = (BbdReverb *)plugin->plugin_data;
   uint32_t magic = kStateMagic;
-  double vals[6];
+  double vals[7];
   vals[0] = self->p_input.load();
   vals[1] = self->p_size.load();
   vals[2] = self->p_decay.load();
   vals[3] = self->p_tone.load();
   vals[4] = self->p_mix.load();
   vals[5] = self->p_ratio.load();
+  vals[6] = self->p_mode.load();
   return writeAll(os, &magic, sizeof(magic)) && writeAll(os, vals, sizeof(vals));
 }
 
 static bool st_load(const clap_plugin_t *plugin, const clap_istream_t *is) {
   auto *self = (BbdReverb *)plugin->plugin_data;
   uint32_t magic = 0;
-  double vals[6] = {0};
+  double vals[7] = {0};
   if (!readAll(is, &magic, sizeof(magic)) || magic != kStateMagic) return false;
   if (!readAll(is, vals, sizeof(vals))) return false;
   self->p_input.store(std::clamp(vals[0], 0.0, 200.0));
@@ -451,6 +516,7 @@ static bool st_load(const clap_plugin_t *plugin, const clap_istream_t *is) {
   self->p_tone.store(std::clamp(vals[3], 0.0, 100.0));
   self->p_mix.store(std::clamp(vals[4], 0.0, 100.0));
   self->p_ratio.store(std::clamp(vals[5], kRatioMin, kRatioMax));
+  self->p_mode.store(vals[6] >= 0.5 ? 1.0 : 0.0);
   return true;
 }
 
@@ -472,9 +538,10 @@ static bool plug_activate(const clap_plugin_t *plugin, double sample_rate,
   self->max_len = (uint32_t)std::ceil(kSizeMsMax * 0.001 * sample_rate) + 8;
   self->buf_a.assign(self->max_len, 0.f);
   self->buf_b.assign(self->max_len, 0.f);
-  // Filter-/Glaettungskoeffs aus der Samplerate.
   self->tone_k = 1.f - (float)std::exp(-2.0 * M_PI * kToneFcHz / sample_rate);
   self->smooth_k = 1.f - (float)std::exp(-1.0 / (kSmoothTauS * sample_rate));
+  self->env_atk = 1.f - (float)std::exp(-1.0 / (kEnvAtkS * sample_rate));
+  self->env_rel = 1.f - (float)std::exp(-1.0 / (kEnvRelS * sample_rate));
   self->clearState();
   return true;
 }

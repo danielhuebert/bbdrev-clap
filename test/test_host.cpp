@@ -58,8 +58,8 @@ static int64_t mem_read(const clap_istream_t *s, void *buf, uint64_t n) {
 
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL: %s\n", #c); return 1; } } while (0)
 
-// Param ids: Input=0 Size=1 Decay=2 Tone=3 Mix=4 Ratio=5
-enum { P_INPUT=0, P_SIZE=1, P_DECAY=2, P_TONE=3, P_MIX=4, P_RATIO=5 };
+// Param ids: Input=0 Size=1 Decay=2 Tone=3 Mix=4 Ratio=5 Mode=6
+enum { P_INPUT=0, P_SIZE=1, P_DECAY=2, P_TONE=3, P_MIX=4, P_RATIO=5, P_MODE=6 };
 
 int main(int argc, char **argv) {
   if (argc < 2) { std::printf("usage: %s <binary-in-bundle>\n", argv[0]); return 2; }
@@ -84,7 +84,7 @@ int main(int argc, char **argv) {
   auto *ports = (const clap_plugin_audio_ports_t *)plug->get_extension(plug, CLAP_EXT_AUDIO_PORTS);
   auto *state = (const clap_plugin_state_t *)plug->get_extension(plug, CLAP_EXT_STATE);
   CHECK(params && ports && state);
-  CHECK(params->count(plug) == 6);
+  CHECK(params->count(plug) == 7);
   CHECK(ports->count(plug, true) == 1 && ports->count(plug, false) == 1);
 
   clap_audio_port_info_t pi;
@@ -206,6 +206,41 @@ int main(int argc, char **argv) {
     std::printf("state roundtrip: size %.0f->%.0f  ratio %.3f->%.3f\n",
                 sBefore, sAfter, rBefore, rAfter);
     CHECK(std::fabs(sAfter - sBefore) < 1e-6 && std::fabs(rAfter - rBefore) < 1e-6);
+  }
+
+  // ---- mono mode: L and R outputs identical, driven by L input only ----
+  {
+    plug->reset(plug);
+    EvList me; me.in.ctx = &me; me.in.size = ev_size; me.in.get = ev_get;
+    me.evs.push_back(mkparam(P_MODE, 1.0, 0));   // Mono
+    me.evs.push_back(mkparam(P_MIX, 100.0, 0));
+    me.evs.push_back(mkparam(P_SIZE, 50.0, 0));
+    me.evs.push_back(mkparam(P_DECAY, 40.0, 0));
+    params->flush(plug, &me.in, &oe);
+    char mtxt[32] = {0};
+    params->value_to_text(plug, P_MODE, 1.0, mtxt, sizeof(mtxt));
+
+    const uint32_t N2 = 4000;
+    std::vector<float> iL(N2, 0), iR(N2, 0), oL(N2, 0), oR(N2, 0);
+    iL[0] = 1.0f;  // impulse on LEFT only; R input is silent
+    float *ic[2] = {iL.data(), iR.data()};
+    float *oc[2] = {oL.data(), oR.data()};
+    clap_audio_buffer_t bi = {ic, nullptr, 2, 0, 0};
+    clap_audio_buffer_t bo = {oc, nullptr, 2, 0, 0};
+    EvList nn; nn.in.ctx = &nn; nn.in.size = ev_size; nn.in.get = ev_get;
+    clap_process_t pm = proc;
+    pm.frames_count = N2; pm.audio_inputs = &bi; pm.audio_outputs = &bo;
+    pm.in_events = &nn.in;
+    CHECK(plug->process(plug, &pm) == CLAP_PROCESS_CONTINUE);
+
+    float diff = 0.f, mag = 0.f;
+    for (uint32_t i = 0; i < N2; ++i) {
+      diff = std::fmax(diff, std::fabs(oL[i] - oR[i]));
+      mag = std::fmax(mag, std::fabs(oL[i]));
+    }
+    std::printf("mono mode (\"%s\"): max|L-R|=%.6g  max|L|=%.4f\n", mtxt, diff, mag);
+    CHECK(mag > 1e-3f);    // reverb from the single (L) input is present
+    CHECK(diff < 1e-6f);   // both outputs identical (true mono)
   }
 
   plug->stop_processing(plug);

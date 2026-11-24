@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 CLAP_TAG="1.2.10"
 NAME="BBD Reverb"
 BUNDLE_ID="com.danielhuebert.bbd-reverb"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # 1. Fetch the CLAP headers if they are not vendored yet.
 if [[ ! -f deps/clap/include/clap/clap.h ]]; then
