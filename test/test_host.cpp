@@ -27,6 +27,30 @@ static const clap_event_header_t *ev_get(const clap_input_events_t *l, uint32_t 
 }
 static bool out_try_push(const clap_output_events_t *, const clap_event_header_t *) { return true; }
 
+// ---- event list carrying param-MOD events (separate from VALUE events) ----
+struct ModList {
+  clap_input_events_t in;
+  std::vector<clap_event_param_mod_t> evs;
+};
+static uint32_t mev_size(const clap_input_events_t *l) {
+  return (uint32_t)((ModList *)l->ctx)->evs.size();
+}
+static const clap_event_header_t *mev_get(const clap_input_events_t *l, uint32_t i) {
+  return &((ModList *)l->ctx)->evs[i].header;
+}
+static clap_event_param_mod_t mkmod(clap_id id, double amount, uint32_t time) {
+  clap_event_param_mod_t e;
+  std::memset(&e, 0, sizeof(e));
+  e.header.size = sizeof(e);
+  e.header.time = time;
+  e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  e.header.type = CLAP_EVENT_PARAM_MOD;
+  e.param_id = id;
+  e.note_id = -1; e.port_index = -1; e.channel = -1; e.key = -1;
+  e.amount = amount;
+  return e;
+}
+
 static clap_event_param_value_t mkparam(clap_id id, double v, uint32_t time) {
   clap_event_param_value_t e;
   std::memset(&e, 0, sizeof(e));
@@ -256,6 +280,67 @@ int main(int argc, char **argv) {
     std::printf("mono mode (\"%s\"): max|L-R|=%.6g  max|L|=%.4f\n", mtxt, diff, mag);
     CHECK(mag > 1e-3f);    // reverb from the single (L) input is present
     CHECK(diff < 1e-6f);   // both outputs identical (true mono)
+  }
+
+  // ---- modulation (CLAP PARAM_MOD): base Mix=0 -> dry only; +100 mod -> wet ----
+  {
+    // Fully specify the state so the result is independent of earlier tests.
+    EvList base; base.in.ctx = &base; base.in.size = ev_size; base.in.get = ev_get;
+    base.evs.push_back(mkparam(P_INPUT, 100.0, 0));
+    base.evs.push_back(mkparam(P_MODE, 0.0, 0));     // stereo
+    base.evs.push_back(mkparam(P_MIX, 0.0, 0));      // fully dry (base)
+    base.evs.push_back(mkparam(P_SIZE, 50.0, 0));
+    base.evs.push_back(mkparam(P_DECAY, 85.0, 0));   // long tail
+    base.evs.push_back(mkparam(P_TONE, 50.0, 0));
+    base.evs.push_back(mkparam(P_RATIO, 1.6180339887, 0));
+    base.evs.push_back(mkparam(P_STAGES, 2.0, 0));   // 2048
+    params->flush(plug, &base.in, &oe);
+
+    const uint32_t N2 = 6000;
+    auto tailMax = [&](const std::vector<float> &o) {
+      float m = 0.f; for (uint32_t i = 1000; i < o.size(); ++i) m = std::fmax(m, std::fabs(o[i]));
+      return m;
+    };
+
+    // (a) control: no modulation -> output is the dry impulse only, tail ~0.
+    plug->reset(plug);
+    std::vector<float> ciL(N2, 0), ciR(N2, 0), coL(N2, 0), coR(N2, 0);
+    ciL[0] = ciR[0] = 1.0f;
+    float *cic[2] = {ciL.data(), ciR.data()};
+    float *coc[2] = {coL.data(), coR.data()};
+    clap_audio_buffer_t cbi = {cic, nullptr, 2, 0, 0};
+    clap_audio_buffer_t cbo = {coc, nullptr, 2, 0, 0};
+    EvList nn; nn.in.ctx = &nn; nn.in.size = ev_size; nn.in.get = ev_get;
+    clap_process_t pc = proc;
+    pc.frames_count = N2; pc.audio_inputs = &cbi; pc.audio_outputs = &cbo;
+    pc.in_events = &nn.in;
+    CHECK(plug->process(plug, &pc) == CLAP_PROCESS_CONTINUE);
+    const float tailDry = tailMax(coL);
+
+    // (b) same, but a PARAM_MOD of +100 on Mix at frame 0 -> wet tail appears.
+    plug->reset(plug);
+    std::vector<float> miL(N2, 0), miR(N2, 0), moL(N2, 0), moR(N2, 0);
+    miL[0] = miR[0] = 1.0f;
+    float *mic[2] = {miL.data(), miR.data()};
+    float *moc[2] = {moL.data(), moR.data()};
+    clap_audio_buffer_t mbi = {mic, nullptr, 2, 0, 0};
+    clap_audio_buffer_t mbo = {moc, nullptr, 2, 0, 0};
+    ModList md; md.in.ctx = &md; md.in.size = mev_size; md.in.get = mev_get;
+    md.evs.push_back(mkmod(P_MIX, 100.0, 0));
+    clap_process_t pmd = proc;
+    pmd.frames_count = N2; pmd.audio_inputs = &mbi; pmd.audio_outputs = &mbo;
+    pmd.in_events = &md.in;
+    CHECK(plug->process(plug, &pmd) == CLAP_PROCESS_CONTINUE);
+    const float tailMod = tailMax(moL);
+
+    std::printf("param-mod: tail dry(base Mix=0)=%.4f  with +100 mod=%.4f\n",
+                tailDry, tailMod);
+    CHECK(tailDry < 1e-3f);    // no modulation handled before -> stays dry
+    CHECK(tailMod > 1e-2f);    // PARAM_MOD actually opens the wet path
+
+    // base Mix value must remain 0 (modulation is not written back to the value).
+    double mixBase = -1; params->get_value(plug, P_MIX, &mixBase);
+    CHECK(std::fabs(mixBase) < 1e-9);
   }
 
   plug->stop_processing(plug);

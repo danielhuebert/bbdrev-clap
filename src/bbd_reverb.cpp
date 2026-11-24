@@ -132,6 +132,15 @@ struct BbdReverb {
   std::atomic<double> p_mode{0.0};  // 0 = Stereo, 1 = Mono
   std::atomic<double> p_stages{(double)kStagesDefaultIdx};  // index 0..3
 
+  // Modulations-Offsets (CLAP PARAM_MOD) fuer die modulierbaren Parameter.
+  // Effektiver Wert = Basiswert (oben) + Offset, erst im Processing angewandt.
+  std::atomic<double> m_input{0.0};
+  std::atomic<double> m_size{0.0};
+  std::atomic<double> m_decay{0.0};
+  std::atomic<double> m_tone{0.0};
+  std::atomic<double> m_mix{0.0};
+  std::atomic<double> m_ratio{0.0};
+
   double sample_rate = 48000.0;
   std::vector<float> buf_a;
   std::vector<float> buf_b;
@@ -170,14 +179,17 @@ struct BbdReverb {
     return (float)((int32_t)x) * 4.6566129e-10f;
   }
 
-  float sizeTargetSamples() const {
-    const double v = p_size.load(std::memory_order_relaxed) * 0.01;
+  float lenForSize(double sizePct) const {
+    const double v = sizePct * 0.01;
     const double ms = kSizeMsMin + v * (kSizeMsMax - kSizeMsMin);
     float d = (float)(ms * 0.001 * sample_rate);
     const float hi = (float)max_len - 2.f;
     if (d < 1.f) d = 1.f;
     if (d > hi) d = hi;
     return d;
+  }
+  float sizeTargetSamples() const {
+    return lenForSize(p_size.load(std::memory_order_relaxed));
   }
 
   // One-Pole-Koeffizient fuer eine Eckfrequenz (Hz).
@@ -217,13 +229,26 @@ struct BbdReverb {
 
   void run(float *outL, float *outR, const float *inL, const float *inR,
            uint32_t n) {
-    const float len_a_t = sizeTargetSamples();
-    const float g_t = kGMin + (float)(p_decay.load(std::memory_order_relaxed) * 0.01) *
-                                  (kGMax - kGMin);
-    const float mix_t = (float)(p_mix.load(std::memory_order_relaxed) * 0.01);
-    const float tone_t = (float)(p_tone.load(std::memory_order_relaxed) * 0.01);
-    const float gain_t = (float)(p_input.load(std::memory_order_relaxed) * 0.01);
-    const float ratio_t = (float)p_ratio.load(std::memory_order_relaxed);
+    // Effektive Werte = Basis + Modulations-Offset (CLAP PARAM_MOD), geklemmt.
+    const double ip = std::clamp(p_input.load(std::memory_order_relaxed) +
+                                 m_input.load(std::memory_order_relaxed), 0.0, 200.0);
+    const double sz = std::clamp(p_size.load(std::memory_order_relaxed) +
+                                 m_size.load(std::memory_order_relaxed), 0.0, 100.0);
+    const double dc = std::clamp(p_decay.load(std::memory_order_relaxed) +
+                                 m_decay.load(std::memory_order_relaxed), 0.0, 100.0);
+    const double tn = std::clamp(p_tone.load(std::memory_order_relaxed) +
+                                 m_tone.load(std::memory_order_relaxed), 0.0, 100.0);
+    const double mx = std::clamp(p_mix.load(std::memory_order_relaxed) +
+                                 m_mix.load(std::memory_order_relaxed), 0.0, 100.0);
+    const double rt = std::clamp(p_ratio.load(std::memory_order_relaxed) +
+                                 m_ratio.load(std::memory_order_relaxed), kRatioMin, kRatioMax);
+
+    const float len_a_t = lenForSize(sz);
+    const float g_t = kGMin + (float)(dc * 0.01) * (kGMax - kGMin);
+    const float mix_t = (float)(mx * 0.01);
+    const float tone_t = (float)(tn * 0.01);
+    const float gain_t = (float)(ip * 0.01);
+    const float ratio_t = (float)rt;
     const float stages_t = stagesValue(p_stages.load(std::memory_order_relaxed));
     const bool mono = p_mode.load(std::memory_order_relaxed) >= 0.5;
 
@@ -322,7 +347,7 @@ static const clap_plugin_descriptor_t s_descriptor = {
     "https://github.com/danielhuebert",
     "",
     "",
-    "1.2.0",
+    "1.2.1",
     "Analoger-BBD-Hall: zwei Delays im goldenen Schnitt + Hadamard-Feedback mit "
     "einem Minuszeichen, mit BBD-Lo-Fi (mki x es.edu / Moritz Klein).",
     s_features,
@@ -494,16 +519,34 @@ static void applyParamEvent(BbdReverb *self, const clap_event_param_value_t *ev)
   }
 }
 
+// CLAP PARAM_MOD: ein additiver Offset auf den Basiswert (globale Modulation).
+static void applyParamMod(BbdReverb *self, const clap_event_param_mod_t *ev) {
+  switch (ev->param_id) {
+    case kParamInput: self->m_input.store(ev->amount); break;
+    case kParamSize:  self->m_size.store(ev->amount); break;
+    case kParamDecay: self->m_decay.store(ev->amount); break;
+    case kParamTone:  self->m_tone.store(ev->amount); break;
+    case kParamMix:   self->m_mix.store(ev->amount); break;
+    case kParamRatio: self->m_ratio.store(ev->amount); break;
+    default: break;  // Mode/Stages sind nicht modulierbar
+  }
+}
+
+// Ein eingehendes Core-Event anwenden (Value oder Mod).
+static void handleEvent(BbdReverb *self, const clap_event_header_t *h) {
+  if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
+  if (h->type == CLAP_EVENT_PARAM_VALUE)
+    applyParamEvent(self, (const clap_event_param_value_t *)h);
+  else if (h->type == CLAP_EVENT_PARAM_MOD)
+    applyParamMod(self, (const clap_event_param_mod_t *)h);
+}
+
 static void pr_flush(const clap_plugin_t *plugin, const clap_input_events_t *in,
                      const clap_output_events_t *) {
   auto *self = (BbdReverb *)plugin->plugin_data;
   const uint32_t n = in->size(in);
-  for (uint32_t i = 0; i < n; ++i) {
-    const clap_event_header_t *h = in->get(in, i);
-    if (h->space_id == CLAP_CORE_EVENT_SPACE_ID &&
-        h->type == CLAP_EVENT_PARAM_VALUE)
-      applyParamEvent(self, (const clap_event_param_value_t *)h);
-  }
+  for (uint32_t i = 0; i < n; ++i)
+    handleEvent(self, in->get(in, i));
 }
 
 static const clap_plugin_params_t s_params = {
@@ -632,9 +675,7 @@ static clap_process_status plug_process(const clap_plugin_t *plugin,
     while (ev_i < nev) {
       const clap_event_header_t *h = evs->get(evs, ev_i);
       if (h->time > cur) break;
-      if (h->space_id == CLAP_CORE_EVENT_SPACE_ID &&
-          h->type == CLAP_EVENT_PARAM_VALUE)
-        applyParamEvent(self, (const clap_event_param_value_t *)h);
+      handleEvent(self, h);
       ++ev_i;
     }
     uint32_t next = nframes;
